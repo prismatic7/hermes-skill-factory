@@ -35,7 +35,7 @@ Generate: [A] SKILL.md  [B] plugin.py  [C] Both  [D] Skip
 Say **C** and it writes both files immediately:
 
 - `~/.hermes/skills/<category>/<name>/SKILL.md` — AI instructions for the workflow
-- `~/.hermes/plugins/<name>.py` — A slash command that triggers it directly
+- `~/.hermes/plugins/<name>/` — a plugin package (plugin.yaml + __init__.py) exposing a slash command
 
 ---
 
@@ -44,7 +44,7 @@ Say **C** and it writes both files immediately:
 **Requirements:** Hermes Agent v2026.3+
 
 ```bash
-git clone https://github.com/your-username/hermes-skill-factory
+git clone https://github.com/Romanescu11/hermes-skill-factory
 cd hermes-skill-factory
 bash install.sh
 ```
@@ -56,16 +56,26 @@ Or manually:
 mkdir -p ~/.hermes/skills/meta/skill-factory
 cp skills/skill-factory/SKILL.md ~/.hermes/skills/meta/skill-factory/
 
-# Install the plugin
-cp plugins/skill_factory.py ~/.hermes/plugins/
+# Install the plugin as a PACKAGE (a directory, not a loose .py)
+mkdir -p ~/.hermes/plugins/skill-factory
+cp plugins/skill-factory/plugin.yaml  ~/.hermes/plugins/skill-factory/
+cp plugins/skill-factory/__init__.py ~/.hermes/plugins/skill-factory/
 ```
 
-Then activate:
+Then enable the plugin:
 
 ```bash
-hermes skills reload
-hermes skills enable skill-factory
+hermes plugins enable skill-factory --no-allow-tool-override
+hermes gateway restart          # so a running gateway picks it up
 ```
+
+> **Why a directory, not a `.py` file?** Hermes plugin discovery skips anything
+> under `~/.hermes/plugins/` that is not a directory
+> (`hermes_cli/plugins_discovery.py::scan_directory`), so a loose
+> `skill_factory.py` is never imported and none of its commands ever register.
+> `--no-allow-tool-override` is required because `plugins enable` otherwise
+> blocks on an interactive capability prompt, which hangs any non-TTY context.
+
 
 ---
 
@@ -75,12 +85,12 @@ Once installed, Skill Factory runs in the background during every session.
 
 | Command | What it does |
 |---|---|
-| `/skill-factory propose` | Analyze the session and propose the top detected skill now |
-| `/skill-factory list` | List all skills generated this session |
-| `/skill-factory status` | Show how many patterns are being tracked |
-| `/skill-factory queue` | Show all detected patterns queued for proposal |
-| `/skill-factory save <name>` | Save the last proposal with a custom name |
-| `/skill-factory clear` | Clear the current session log |
+| `/skill-factory-propose` | Analyze the session and propose the top detected skill now |
+| `/skill-factory-list` | List all skills generated this session |
+| `/skill-factory-status` | Show how many patterns are being tracked |
+| `/skill-factory-queue` | Show all detected patterns queued for proposal |
+| `/skill-factory-save <name>` | Save the last proposal with a custom name |
+| `/skill-factory-clear` | Clear the current session log |
 
 **Tip:** You can also just tell Hermes naturally:
 - *"Save this as a skill"*
@@ -123,13 +133,24 @@ tags: [python, venv, testing]
 A scaffolded Hermes plugin with a slash command:
 
 ```python
-def register(hermes):
-    @hermes.command(name="python-env-setup", ...)
-    async def run_skill(ctx, args=""):
+from __future__ import annotations
+import json
+
+_CTX = None
+
+def _run(args=None, **kwargs):
+    try:
         # Step 1: Create venv
         # Step 2: Install deps
         # Step 3: Run tests
-        ...
+        return "Running **Python Env Setup** workflow."
+    except Exception as exc:
+        return json.dumps({"error": f"{type(exc).__name__}: {exc}"})
+
+def register(ctx) -> None:
+    global _CTX
+    _CTX = ctx
+    ctx.register_command("python-env-setup", _run, description="Reproducible Python project setup")
 ```
 
 ---
@@ -142,7 +163,7 @@ hermes-skill-factory/
 │   └── skill-factory/
 │       └── SKILL.md          # The meta-skill (core AI instructions)
 ├── plugins/
-│   └── skill_factory.py      # Plugin: /skill-factory commands
+│   └── skill-factory/        # Plugin package: /skill-factory-* commands
 ├── templates/
 │   ├── SKILL_TEMPLATE.md     # Template for generated skills
 │   └── PLUGIN_TEMPLATE.py    # Template for generated plugins
@@ -163,7 +184,7 @@ See [docs/how-it-works.md](docs/how-it-works.md) for a full breakdown.
 
 **TL;DR:**
 1. `SKILL.md` teaches the Hermes AI *how* to observe, detect, and propose skills
-2. `skill_factory.py` provides the `/skill-factory` commands and file generation
+2. `plugins/skill-factory/` provides the `/skill-factory-*` commands and file generation
 3. You work normally — Skill Factory watches silently and proposes at the right moment
 
 ---

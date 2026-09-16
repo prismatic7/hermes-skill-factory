@@ -29,14 +29,14 @@ Skill Factory has three components that work together:
 ┌─────────────────────────────────────────────────────────────┐
 │           plugin.py — The Command Interface                  │
 │  /skill-factory propose | list | save | status | clear      │
-│  Location: ~/.hermes/plugins/skill_factory.py               │
+│  Location: ~/.hermes/plugins/skill-factory/ (package)       │
 └──────────────────────────┬──────────────────────────────────┘
                            │ writes files to disk
                            ▼
 ┌──────────────────────────────────────────────────┐
 │  Generated Skill Package                         │
 │  ~/.hermes/skills/<category>/<name>/SKILL.md     │
-│  ~/.hermes/plugins/<name>.py                     │
+│  ~/.hermes/plugins/<name>/  (package)            │
 └──────────────────────────────────────────────────┘
 ```
 
@@ -95,9 +95,9 @@ When you approve, Skill Factory writes two files:
 | File | Purpose | Location |
 |---|---|---|
 | `SKILL.md` (meta-skill) | Teaches Hermes to be a Skill Factory | `~/.hermes/skills/meta/skill-factory/SKILL.md` |
-| `skill_factory.py` (plugin) | Provides `/skill-factory` commands | `~/.hermes/plugins/skill_factory.py` |
+| `skill-factory/` (plugin) | Provides `/skill-factory-*` commands | `~/.hermes/plugins/skill-factory/` |
 | Generated skills | Your captured workflows | `~/.hermes/skills/<category>/<name>/SKILL.md` |
-| Generated plugins | Your captured commands | `~/.hermes/plugins/<name>.py` |
+| Generated plugins | Your captured commands | `~/.hermes/plugins/<name>/` |
 
 ---
 
@@ -109,7 +109,7 @@ Generated skills are a starting point, not a final product. After generation:
 2. Refine the workflow steps to match your exact process
 3. Add more examples from real sessions
 4. Add quality checklists specific to your domain
-5. Run `hermes skills reload` to activate
+5. Enable the generated plugin: `hermes plugins enable <name> --no-allow-tool-override`, then `hermes gateway restart`
 
 The generated `plugin.py` contains TODO comments where you should fill in the actual implementation logic.
 

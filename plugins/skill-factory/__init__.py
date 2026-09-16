@@ -70,41 +70,67 @@ class SessionTracker:
     """Tracks workflow patterns within the current Hermes session.
 
     Persisted through ``ctx.state`` when available (profile-scoped, survives
-    process restarts); falls back to process memory on older cores.
+    process restarts); falls back to process memory otherwise.
+
+    ``PluginState`` exposes ``get``/``set`` — it is NOT a dict (no
+    ``__setitem__``), so attribute-free item assignment raises TypeError. The
+    in-memory cache also matters for cost: the observation hook fires on every
+    tool call, and going through ``ctx.state`` for each one would read and
+    atomically rewrite the whole JSON blob every time.
     """
+
+    #: flush the in-memory cache to ctx.state at most once per N records
+    _FLUSH_EVERY = 20
+    #: hard cap on retained events
+    _MAX_EVENTS = 500
 
     def __init__(self, store: Optional[Any] = None):
         self._store = store
         self.session_start = datetime.now()
+        self._cache: Optional[dict] = None
+        self._dirty = 0
 
     # -- storage ---------------------------------------------------------- #
 
+    def _blank(self) -> dict:
+        return {
+            "schema_version": _SCHEMA_VERSION,
+            "events": [],
+            "proposal_queue": [],
+            "generated_skills": [],
+            "last_proposal": None,
+        }
+
     def _load(self) -> dict:
+        if self._cache is not None:
+            return self._cache
+        data = None
         if self._store is not None:
             try:
                 data = self._store.get("tracker")
-                if isinstance(data, dict):
-                    return data
             except Exception:
-                pass
-        if not hasattr(self, "_mem"):
-            self._mem = {}
-        return self._mem
+                data = None
+        if not isinstance(data, dict):
+            data = self._blank()
+        self._cache = data
+        return data
 
-    def _save(self, data: dict) -> None:
-        if self._store is not None:
-            try:
-                self._store["tracker"] = data
-                return
-            except Exception:
-                pass
-        self._mem = data
+    def _flush(self) -> None:
+        if self._store is None or self._cache is None:
+            return
+        try:  # PluginState.set(key, value) — not item assignment
+            self._store.set("tracker", self._cache)
+            self._dirty = 0
+        except Exception:
+            pass  # persistence is best-effort; never break a turn
 
-    def _mutate(self, fn) -> None:
+    def _mutate(self, fn, *, immediate: bool = False) -> None:
         data = self._load()
         fn(data)
         data["schema_version"] = _SCHEMA_VERSION
-        self._save(data)
+        self._dirty += 1
+        if immediate or self._dirty >= self._FLUSH_EVERY:
+            self._flush()
 
     # -- API -------------------------------------------------------------- #
 
@@ -130,8 +156,7 @@ class SessionTracker:
             events.append(
                 {"type": event_type, "data": data, "timestamp": datetime.now().isoformat()}
             )
-            # bound the log: a long session must not grow this without limit
-            del events[:-500]
+            del events[: -self._MAX_EVENTS]
 
         self._mutate(_do)
 
@@ -140,7 +165,7 @@ class SessionTracker:
             d.setdefault("proposal_queue", []).append(proposal)
             d["last_proposal"] = proposal
 
-        self._mutate(_do)
+        self._mutate(_do, immediate=True)
 
     def mark_generated(self, skill_name: str, files: list) -> None:
         def _do(d: dict) -> None:
@@ -152,12 +177,31 @@ class SessionTracker:
                 }
             )
 
-        self._mutate(_do)
+        self._mutate(_do, immediate=True)
 
     def clear(self) -> None:
-        self._save({"schema_version": _SCHEMA_VERSION, "events": [],
-                    "proposal_queue": [], "generated_skills": [],
-                    "last_proposal": None})
+        self._cache = self._blank()
+        self._flush()
+
+    # -- pattern detection ------------------------------------------------ #
+
+    def repeated_tools(self, min_count: int = 3) -> list:
+        """Tools seen at least ``min_count`` times, most frequent first.
+
+        This is the deterministic half of "detect a workflow": the plugin can
+        see tool frequency but not intent, so it surfaces the candidates and
+        lets the model decide which is worth capturing.
+        """
+        counts: dict = {}
+        for ev in self.events:
+            if ev.get("type") != "tool_call":
+                continue
+            tool = (ev.get("data") or {}).get("tool")
+            if tool:
+                counts[tool] = counts.get(tool, 0) + 1
+        ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        return [(t, n) for t, n in ranked if n >= min_count]
+
 
 
 _tracker = SessionTracker()
@@ -199,49 +243,58 @@ def generate_skill_md(
     tags_str = ", ".join(tags)
     display_name = skill_name.replace("-", " ").title()
 
-    content = textwrap.dedent(
-        f"""\
-        ---
-        name: {display_name}
-        version: 1.0.0
-        category: {category}
-        description: {description}
-        tags: [{tags_str}]
-        generated_by: skill-factory
-        generated_at: {datetime.now().strftime("%Y-%m-%d")}
-        ---
+    # NB: textwrap.dedent() strips only the COMMON leading whitespace, and an
+    # f-string's interpolated values (description, steps, ...) start at column 0.
+    # A multi-line interpolation therefore flattens the common prefix to "" and
+    # NOTHING is stripped — which left every line indented 8 spaces and made the
+    # YAML frontmatter unparseable (Hermes' own parser returned {}). Build the
+    # text unindented instead, so no dedent is needed at all.
+    frontmatter = "\n".join([
+        "---",
+        f"name: {display_name}",
+        "version: 1.0.0",
+        f"category: {category}",
+        f"description: {description}",
+        f"tags: [{tags_str}]",
+        "generated_by: skill-factory",
+        f"generated_at: {datetime.now().strftime('%Y-%m-%d')}",
+        "---",
+    ])
 
-        # {display_name}
-
-        {description}
-
-        ## When to Activate
-
-        Activate this skill when you need to perform the {display_name} workflow.
-        This skill was auto-generated from a live session by Skill Factory.
-
-        ## Workflow
-
-        ### Steps
-
-        {steps_md}
-
-        ## Quality Checklist
-
-        Before completing this workflow:
-        - [ ] All steps completed in order
-        - [ ] Output verified against expected result
-        - [ ] No side effects left behind
-
-        ## Examples
-        {examples_md}
-
-        ## Integration
-
-        This skill was generated by the [Skill Factory]({REPO_URL})
-        meta-skill. Edit this file to refine the workflow steps and examples.
-        """
-    )
+    content = "\n".join([
+        frontmatter,
+        "",
+        f"# {display_name}",
+        "",
+        description,
+        "",
+        "## When to Activate",
+        "",
+        f"Activate this skill when you need to perform the {display_name} workflow.",
+        "This skill was auto-generated from a live session by Skill Factory.",
+        "",
+        "## Workflow",
+        "",
+        "### Steps",
+        "",
+        steps_md,
+        "",
+        "## Quality Checklist",
+        "",
+        "Before completing this workflow:",
+        "- [ ] All steps completed in order",
+        "- [ ] Output verified against expected result",
+        "- [ ] No side effects left behind",
+        "",
+        "## Examples",
+        examples_md.rstrip(),
+        "",
+        "## Integration",
+        "",
+        f"This skill was generated by the [Skill Factory]({REPO_URL})",
+        "meta-skill. Edit this file to refine the workflow steps and examples.",
+        "",
+    ])
 
     target_dir = _skill_dir(category, skill_name)
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -266,86 +319,87 @@ def generate_plugin_package(
 
     fn_name = skill_name.replace("-", "_")
     display_name = skill_name.replace("-", " ").title()
-    steps_comments = "\n        ".join(
-        f"# Step {i + 1}: {s}" for i, s in enumerate(workflow_steps)
-    )
 
-    manifest = textwrap.dedent(
-        f"""\
-        name: {skill_name}
-        version: 1.0.0
-        description: {json.dumps(description)}
-        author: skill-factory
-        provides_tools:
-        - {fn_name}_run
-        """
-    )
+    # Build the manifest as plain lines: same textwrap.dedent trap as
+    # generate_skill_md (interpolated values sit at column 0, so the common
+    # prefix collapses and nothing is stripped).
+    manifest = "\n".join([
+        f"name: {skill_name}",
+        "version: 1.0.0",
+        f"description: {json.dumps(description)}",
+        "author: skill-factory",
+        "provides_tools:",
+        f"- {fn_name}_run",
+        "",
+    ])
     (target_dir / "plugin.yaml").write_text(manifest, encoding="utf-8")
 
-    body = textwrap.dedent(
-        f'''\
-        """{display_name} — Auto-generated by Skill Factory.
+    steps_literal = "\n".join(f'        {s!r},' for s in (workflow_steps or ["implement me"]))
 
-        {description}
-
-        Generated from a live session. Edit the handler below to implement the
-        steps. Invoke with /{skill_name} (or the registered tool
-        {{tool}}).
-        """
-
-        from __future__ import annotations
-
-        import json
-
-        PLUGIN_NAME = "{skill_name}"
-        PLUGIN_VERSION = "1.0.0"
-        PLUGIN_DESCRIPTION = {json.dumps(description)}
-
-        _CTX = None
-
-
-        def _steps():
-            return [
-        {chr(10).join(f'        "{s}",' for s in workflow_steps) if workflow_steps else '        "implement me",'}
-            ]
-
-
-        def _run(args=None, **kwargs):
-            """Command/tool handler. Returns a string; never raises."""
-            try:
-                steps = _steps()
-                return "**{display_name}** — {{n}} step(s):\\n".format(n=len(steps)) + "\\n".join(
-                    f"{{i}}. {{s}}" for i, s in enumerate(steps, 1)
-                ) + "\\n\\nEdit `~/.hermes/plugins/{skill_name}/__init__.py` to implement."
-            except Exception as exc:
-                return json.dumps({{"error": f"{{type(exc).__name__}}: {{exc}}"}})
-
-
-        def register(ctx) -> None:
-            """Wire the generated command and tool."""
-            global _CTX
-            _CTX = ctx
-            ctx.register_command(
-                "{skill_name}",
-                _run,
-                description={json.dumps(description)},
-            )
-            ctx.register_tool(
-                name="{fn_name}_run",
-                toolset="{fn_name}",
-                schema={{
-                    "type": "object",
-                    "properties": {{
-                        "input": {{"type": "string", "description": "optional input"}},
-                    }},
-                    "additionalProperties": False,
-                }},
-                handler=_run,
-                description={json.dumps(description or skill_name)},
-                emoji="\\U0001f527",
-            )
-        '''
-    )
+    body = "\n".join([
+        f'"""{display_name} — Auto-generated by Skill Factory.',
+        "",
+        description,
+        "",
+        "Generated from a live session. Edit the handler below to implement the",
+        f"steps. Invoke with /{skill_name}.",
+        '"""',
+        "",
+        "from __future__ import annotations",
+        "",
+        "import json",
+        "",
+        f"PLUGIN_NAME = {skill_name!r}",
+        'PLUGIN_VERSION = "1.0.0"',
+        f"PLUGIN_DESCRIPTION = {description!r}",
+        "",
+        "_CTX = None",
+        "",
+        "",
+        "def _steps():",
+        "    return [",
+        steps_literal,
+        "    ]",
+        "",
+        "",
+        "def _run(args=None, **kwargs):",
+        '    """Command/tool handler. Returns a string; never raises."""',
+        "    try:",
+        "        steps = _steps()",
+        f'        head = "**{display_name}** — {{n}} step(s):".format(n=len(steps))',
+        '        listed = "\\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))',
+        f'        tail = ("\\n\\nEdit `~/.hermes/plugins/{skill_name}/__init__.py` "',
+        '                "to implement the steps.")',
+        "        return head + \"\\n\" + listed + tail",
+        "    except Exception as exc:",
+        '        return json.dumps({"error": f"{type(exc).__name__}: {exc}"})',
+        "",
+        "",
+        "def register(ctx) -> None:",
+        '    """Wire the generated command and tool."""',
+        "    global _CTX",
+        "    _CTX = ctx",
+        "    ctx.register_command(",
+        f"        {skill_name!r},",
+        "        _run,",
+        f"        description={description!r},",
+        "    )",
+        "    ctx.register_tool(",
+        f"        name={fn_name + '_run'!r},",
+        f"        toolset={fn_name!r},",
+        '        schema={',
+        '            "type": "object",',
+        '            "properties": {',
+        '                "input": {"type": "string", "description": "optional input"},',
+        "            },",
+        '            "additionalProperties": False,',
+        "        },",
+        "        handler=_run,",
+        f"        description={(description or skill_name)!r},",
+        '        emoji="\\U0001f527",',
+        "    )",
+        "",
+    ])
     (target_dir / "__init__.py").write_text(body, encoding="utf-8")
 
     return target_dir, [str(target_dir / "plugin.yaml"), str(target_dir / "__init__.py")]
@@ -386,19 +440,127 @@ def register(ctx) -> None:
         _store = None
     _tracker = SessionTracker(store=_store)
 
+    # One-shot context bridge. A plugin command's return value is rendered to
+    # the USER only (cli.py `_cprint`s it and never queues it as a turn), so
+    # returning "go analyse the session" would never reach the model. A
+    # `pre_llm_call` callback can return {"context": ...}, which the core
+    # appends to the NEXT user message — that is the only portable way to hand
+    # the model an instruction from a command.
+    pending_context: list = []
+
+    def on_pre_llm_call(**kwargs):
+        if not pending_context:
+            return None
+        text = pending_context.pop(0)
+        return {"context": text}
+
     # -- propose ---------------------------------------------------------- #
     async def cmd_propose(args: str = "", **kwargs):
-        header = (
-            "Skill Factory — analysing this session.\n\n"
-            "The skill-factory meta-skill is active. Review the workflows from "
-            "this session and propose the most reusable one.\n\n"
-            "_Tip: the meta-skill must be installed at "
-            "`~/.hermes/skills/meta/skill-factory/SKILL.md` for AI-driven "
-            "proposals._"
+        """Ask the model to analyse the session and propose a capture."""
+        # Deterministic candidates the plugin CAN see (tool frequency).
+        top = _tracker.repeated_tools()[:8]
+        if top:
+            observed = "Tools used repeatedly this session:\n" + "\n".join(
+                f"  - {t} x{n}" for t, n in top
+            )
+        else:
+            observed = (
+                "No tool has been used 3+ times yet this session, so there is "
+                f"nothing obviously repeated. Events recorded: {len(_tracker.events)}."
+            )
+
+        pending_context.append(
+            "The user ran /skill-factory-propose. Act as the Skill Factory "
+            "meta-skill (see your active SKILL.md).\n\n"
+            f"{observed}\n\n"
+            "Pick the single most valuable repeatable workflow from THIS "
+            "session's conversation history. Then capture it by calling the "
+            "`skill_factory_capture` tool with:\n"
+            "  name        - kebab-case, e.g. git-pr-workflow\n"
+            "  description - one line\n"
+            "  category    - e.g. software-development, sysadmin, research\n"
+            "  steps       - ordered list of concrete steps\n"
+            "  examples    - optional concrete examples from this session\n"
+            "  tags        - optional short tags\n"
+            "Do not just describe the skill — call the tool so it is written to "
+            "disk. If nothing in this session is worth capturing, say so and "
+            "stop."
         )
-        # The pattern analysis itself is the AI's job via SKILL.md; returning the
-        # text puts the instruction in front of the model on every surface.
-        return header
+        return (
+            "Skill Factory: analysing this session. The proposal request has "
+            "been queued and will reach the model on your next message — send "
+            "any message (e.g. \"go\") to complete the proposal."
+        )
+
+    # -- capture ---------------------------------------------------------- #
+    def tool_capture(args=None, **kwargs):
+        """Persist a proposal and generate the skill + plugin package.
+
+        This is the write path the whole plugin exists for. It is a TOOL rather
+        than only a slash command so the model can complete the
+        propose -> capture -> generate loop in a single turn: the model calls
+        it after analyse, and the files land immediately.
+        """
+        args = args or {}
+        try:
+            raw_name = str(args.get("name") or "").strip()
+            if not raw_name:
+                return json.dumps({"error": "name is required"})
+            skill_name = _sanitize_name(raw_name)
+            if not skill_name:
+                return json.dumps({"error": f"name {raw_name!r} has no usable characters"})
+
+            description = str(args.get("description") or f"Auto-generated skill: {skill_name}")
+            category = _sanitize_name(str(args.get("category") or "custom")) or "custom"
+            steps = args.get("steps") or []
+            if isinstance(steps, str):
+                steps = [s.strip() for s in steps.splitlines() if s.strip()]
+            if not isinstance(steps, list) or not steps:
+                return json.dumps({"error": "steps must be a non-empty list"})
+            examples = args.get("examples") or []
+            if isinstance(examples, str):
+                examples = [examples]
+            tags = args.get("tags") or ["generated", "skill-factory"]
+            if isinstance(tags, str):
+                tags = [t.strip() for t in tags.split(",") if t.strip()]
+
+            proposal = {
+                "name": skill_name,
+                "description": description,
+                "category": category,
+                "steps": [str(s) for s in steps],
+                "examples": [str(e) for e in examples],
+                "tags": [str(t) for t in tags],
+            }
+            # Record it so /skill-factory-queue and /skill-factory-save agree
+            # with what was generated. Previously NOTHING called add_to_queue,
+            # which made `save` unreachable ("No proposal active" forever).
+            _tracker.add_to_queue(proposal)
+
+            md_path, _ = generate_skill_md(
+                skill_name, category, description, proposal["steps"],
+                proposal["examples"], proposal["tags"],
+            )
+            pkg_dir, pkg_files = generate_plugin_package(
+                skill_name, description, proposal["steps"],
+            )
+            files = [str(md_path)] + pkg_files
+            _tracker.mark_generated(skill_name, files)
+
+            return json.dumps(
+                {
+                    "ok": True,
+                    "skill": skill_name,
+                    "files": files,
+                    "next": (
+                        f"hermes plugins enable {skill_name} --no-allow-tool-override"
+                        " && hermes gateway restart"
+                    ),
+                },
+                indent=2,
+            )
+        except Exception as exc:
+            return json.dumps({"error": f"{type(exc).__name__}: {exc}"})
 
     # -- list ------------------------------------------------------------- #
     async def cmd_list(args: str = "", **kwargs):
@@ -413,12 +575,15 @@ def register(ctx) -> None:
     # -- status ----------------------------------------------------------- #
     async def cmd_status(args: str = "", **kwargs):
         minutes = int((datetime.now() - _tracker.session_start).total_seconds() / 60)
+        top = _tracker.repeated_tools()[:5]
+        observed = ", ".join(f"{t} x{n}" for t, n in top) or "none yet"
         return (
             f"Skill Factory status\n\n"
             f"- session duration: {minutes} min\n"
             f"- events tracked: {len(_tracker.events)}\n"
             f"- proposals queued: {len(_tracker.proposal_queue)}\n"
-            f"- skills generated: {len(_tracker.generated_skills)}\n\n"
+            f"- skills generated: {len(_tracker.generated_skills)}\n"
+            f"- repeated tools: {observed}\n\n"
             f"Run `/skill-factory-propose` to surface a proposal now."
         )
 
@@ -439,23 +604,29 @@ def register(ctx) -> None:
 
     # -- save ------------------------------------------------------------- #
     async def cmd_save(args: str = "", **kwargs):
+        """Re-generate the last captured proposal under a different name."""
         skill_name = _sanitize_name(args.strip()) if args.strip() else None
         if not skill_name:
             return "Provide a skill name. Example:\n`/skill-factory-save my-workflow-name`"
-        if not _tracker.last_proposal:
+        proposal = _tracker.last_proposal
+        if not proposal:
             return (
                 "No proposal active. Run `/skill-factory-propose` first, then "
                 "`/skill-factory-save <name>`."
             )
-        proposal = _tracker.last_proposal
-        category = proposal.get("category", "custom")
-        description = proposal.get("description", f"Auto-generated skill: {skill_name}")
-        steps = proposal.get("steps", ["Step 1: implement me"])
-        examples = proposal.get("examples", [])
-        tags = proposal.get("tags", ["generated", "skill-factory"])
         try:
-            md_path, _ = generate_skill_md(skill_name, category, description, steps, examples, tags)
-            pkg_dir, pkg_files = generate_plugin_package(skill_name, description, steps)
+            md_path, _ = generate_skill_md(
+                skill_name, proposal.get("category", "custom"),
+                proposal.get("description", f"Auto-generated skill: {skill_name}"),
+                proposal.get("steps", ["implement me"]),
+                proposal.get("examples", []),
+                proposal.get("tags", ["generated", "skill-factory"]),
+            )
+            pkg_dir, pkg_files = generate_plugin_package(
+                skill_name,
+                proposal.get("description", f"Auto-generated skill: {skill_name}"),
+                proposal.get("steps", ["implement me"]),
+            )
             files = [str(md_path)] + pkg_files
             _tracker.mark_generated(skill_name, files)
             return (
@@ -481,6 +652,7 @@ def register(ctx) -> None:
                     "events_tracked": len(_tracker.events),
                     "proposals_queued": len(_tracker.proposal_queue),
                     "skills_generated": len(_tracker.generated_skills),
+                    "repeated_tools": _tracker.repeated_tools()[:10],
                     "skills_dir": str(_skills_dir()),
                     "plugins_dir": str(_plugins_dir()),
                 },
@@ -531,4 +703,36 @@ def register(ctx) -> None:
         emoji="\U0001f3ed",
     )
 
+    # The write path — model-callable so propose -> capture -> generate
+    # completes inside one turn.
+    ctx.register_tool(
+        name="skill_factory_capture",
+        toolset="skill_factory",
+        schema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "kebab-case skill name, e.g. git-pr-workflow"},
+                "description": {"type": "string", "description": "one-line description of the workflow"},
+                "category": {"type": "string", "description": "skill category directory, e.g. software-development"},
+                "steps": {"type": "array", "items": {"type": "string"},
+                          "description": "ordered concrete steps of the workflow"},
+                "examples": {"type": "array", "items": {"type": "string"},
+                             "description": "optional concrete examples"},
+                "tags": {"type": "array", "items": {"type": "string"},
+                         "description": "optional short tags"},
+            },
+            "required": ["name", "steps"],
+            "additionalProperties": False,
+        },
+        handler=tool_capture,
+        description=(
+            "Write a captured workflow to disk as a SKILL.md plus an installable Hermes "
+            "plugin package. Call this to complete a Skill Factory proposal. Returns the "
+            "written file paths."
+        ),
+        emoji="\U0001f3ed",
+    )
+
     ctx.register_hook("post_tool_call", on_post_tool_call)
+    ctx.register_hook("pre_llm_call", on_pre_llm_call)
+

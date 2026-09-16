@@ -1,5 +1,9 @@
 # 🏭 Skill Factory
 
+> **This is a maintained fork.** The upstream repo was last updated 2026-03-18 and
+> its documented install has never produced a working plugin. See [FORK.md](FORK.md)
+> for what was broken, what changed, and the breaking command-name change.
+
 > **The meta-skill that creates skills.**
 > Your AI watches your workflows and turns them into reusable Hermes skills — automatically.
 

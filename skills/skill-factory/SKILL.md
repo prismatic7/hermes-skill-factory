@@ -1,6 +1,6 @@
 ---
 name: Skill Factory
-version: 1.0.0
+version: 1.1.0
 author: community
 category: meta
 description: A meta-skill that silently watches your workflows and automatically generates reusable Hermes skills from them.
@@ -47,7 +47,7 @@ Propose skill creation when ANY of the following occur:
 | Trigger | Example |
 |---|---|
 | User explicitly requests | "save this as a skill", "remember this workflow", "let's capture this" |
-| Slash command | `/skill-factory propose` |
+| Slash command | `/skill-factory-propose` |
 | Repeated pattern (2x+) | Same workflow appeared twice in the session |
 | Session winding down | User says "done", "thanks", "that's all", or asks unrelated wrap-up questions |
 | User expresses frustration | "I always have to do this manually..." |
@@ -97,7 +97,7 @@ When the user approves, generate a complete SKILL.md using this exact template:
 ```markdown
 ---
 name: [Skill Name]
-version: 1.0.0
+version: 1.1.0
 category: [category]
 description: [one-line description]
 tags: [tag1, tag2, tag3]
@@ -292,9 +292,32 @@ Generated plugin.py files MUST:
 
 | Command | Description |
 |---|---|
-| `/skill-factory propose` | Analyze current session and propose the top detected skill now |
-| `/skill-factory list` | Show all skills generated in this session |
-| `/skill-factory status` | Show what patterns are currently being tracked |
-| `/skill-factory queue` | Show all detected patterns queued for proposal |
-| `/skill-factory save <name>` | Immediately name and save the last proposed skill |
-| `/skill-factory clear` | Clear the current session tracking log |
+| `/skill-factory-propose` | Ask the model to analyse this session and propose the top workflow |
+| `/skill-factory-list` | Show all skills generated in this session |
+| `/skill-factory-status` | Show what patterns are currently being tracked |
+| `/skill-factory-queue` | Show all detected patterns queued for proposal |
+| `/skill-factory-save <name>` | Re-generate the last captured proposal under a new name |
+| `/skill-factory-clear` | Clear the current session tracking log |
+
+**Note:** Hermes plugin commands are flat and hyphenated — the older
+`/skill-factory propose` form (with a space) can never register.
+
+### Tools
+
+| Tool | Description |
+|---|---|
+| `skill_factory_capture` | **The write path.** Persists a proposal and writes the SKILL.md + plugin package to disk. |
+| `skill_factory_status` | Tracking state as JSON (events, queue, generated skills, repeated tools, paths). |
+
+`skill_factory_capture` is a tool rather than a slash command so the
+`propose → analyse → capture → generate` loop completes **inside one turn**:
+the model calls it directly after analysing, and the files land immediately.
+
+| `skill_factory_capture` argument | Description |
+|---|---|
+| `name` (required) | kebab-case skill name, e.g. `git-pr-workflow` |
+| `steps` (required) | ordered list of concrete steps |
+| `description` | one-line description |
+| `category` | category directory, e.g. `software-development` |
+| `examples` | optional concrete examples from the session |
+| `tags` | optional short tags |

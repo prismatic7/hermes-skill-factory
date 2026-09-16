@@ -1,8 +1,10 @@
 name: skill-factory
-version: "1.1.0"
+version: "1.2.0"
 description: "Watches your workflows and generates reusable Hermes skills automatically — the command interface for the Skill Factory meta-skill."
 author: "Romanescu11 (upstream), prismatic7 (fixes)"
 provides_tools:
   - skill_factory_status
+  - skill_factory_capture
 provides_hooks:
   - post_tool_call
+  - pre_llm_call
